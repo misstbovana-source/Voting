@@ -1,0 +1,15 @@
+{
+  "hosting": {
+    "public": "dist",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [{ "source": "**", "destination": "/index.html" }]
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "python-payments",
+      "runtime": "python313",
+      "ignore": ["venv", ".git", "__pycache__", "*.local"]
+    }
+  ]
+}
