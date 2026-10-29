@@ -84,6 +84,8 @@ const fmtDateTime = (iso) => {
 
 const money = (n) => `R${Number(n || 0).toFixed(2)}`;
 
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
 const initials = (name) =>
   (name || '?')
     .split(/\s+/)
@@ -134,6 +136,8 @@ const btnPrimary =
   'inline-flex items-center justify-center rounded-xl bg-[#543737] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#6e4d4d] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#543737]';
 const btnGhost =
   'inline-flex items-center justify-center rounded-xl border border-[#e6dde2] bg-white px-4 py-2.5 text-sm font-bold text-[#543737] transition hover:bg-[#faf6f7] disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#543737]';
+const btnDanger =
+  'inline-flex items-center justify-center rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600';
 
 // --------------------------------------------------------------------------- //
 // Small pieces
@@ -326,11 +330,32 @@ function ProfileSkeleton() {
 // --------------------------------------------------------------------------- //
 
 function ArtistView({ target, isSelf, onClose, onVote, onVoters }) {
+  const [reload, setReload] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  const [actionNote, setActionNote] = useState(null);
   const { data, error, loading } = useApi(
-    `/api/competitions/${enc(target.competitionId)}/artists/${enc(target.artistId)}/voting?source=${enc(target.source)}`,
+    `/api/competitions/${enc(target.competitionId)}/artists/${enc(target.artistId)}/voting?source=${enc(target.source)}&r=${reload}`,
   );
   const a = data?.artist;
   const chip = a && VOTING_CHIP[a.votingStatus];
+
+  const eliminate = async () => {
+    if (!a?.acceptedId) return;
+    if (!window.confirm(`Eliminate ${a.artistName}? This can't be undone.`)) return;
+    setBusy(true);
+    setActionError(null);
+    setActionNote(null);
+    try {
+      const res = await api(`/api/accepted-artists/${enc(a.acceptedId)}/eliminate`, { method: 'POST' });
+      setActionNote(res.message || 'Artist eliminated.');
+      setReload((r) => r + 1); // reloads the artist so the status and "artists left" update
+    } catch (e) {
+      setActionError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <Modal title={target.name || 'Artist'} onClose={onClose}>
@@ -347,8 +372,19 @@ function ArtistView({ target, isSelf, onClose, onVote, onVoters }) {
             rows={[
               ['Voting closes', fmtDateTime(a.votingClosingDateTime)],
               ['Top results', fmtDateTime(a.top10ClosingDateTime)],
+              ['Artists left', a.artistsLeft != null && a.topCount ? `${a.artistsLeft} (top ${a.topCount})` : null],
             ]}
           />
+          {actionError && (
+            <div className="mt-3">
+              <ErrorText>{actionError}</ErrorText>
+            </div>
+          )}
+          {actionNote && !actionError && (
+            <p role="status" className="mt-3 rounded-xl bg-emerald-50 px-3 py-2.5 text-sm text-emerald-800 ring-1 ring-emerald-200">
+              {actionNote}
+            </p>
+          )}
           <div className="mt-5 flex flex-wrap gap-2">
             {a.votingStatus === 'eligible' && (
               <button onClick={() => onVote(a)} className={btnPrimary}>
@@ -360,6 +396,11 @@ function ArtistView({ target, isSelf, onClose, onVote, onVoters }) {
                 Top voters
               </button>
             )}
+            {a.canEliminate && (
+              <button onClick={eliminate} disabled={busy} className={btnDanger}>
+                {busy ? 'Eliminating…' : 'Eliminate'}
+              </button>
+            )}
           </div>
         </>
       )}
@@ -367,7 +408,7 @@ function ArtistView({ target, isSelf, onClose, onVote, onVoters }) {
   );
 }
 
-function CompetitionView({ target, isSelf, onClose, onArtists, onVoters }) {
+function CompetitionView({ target, onClose, onArtists, onVoters }) {
   const { data, error, loading } = useApi(`/api/competitions/${enc(target.id)}/overview?source=${enc(target.source)}`);
   const c = data?.competition;
 
@@ -379,9 +420,7 @@ function CompetitionView({ target, isSelf, onClose, onArtists, onVoters }) {
         <>
           <Hero src={c.imageUrl} alt={c.name} />
           <div className="mt-4 flex flex-wrap items-center gap-2">
-            {c.awaitingApproval ? (
-              <Chip tone="bg-amber-50 text-amber-800 ring-amber-200">Awaiting approval</Chip>
-            ) : c.votingClosed ? (
+            {c.votingClosed ? (
               <Chip tone="bg-slate-100 text-slate-600 ring-slate-200">Voting closed</Chip>
             ) : (
               <Chip tone="bg-emerald-50 text-emerald-700 ring-emerald-200">Open</Chip>
@@ -396,13 +435,14 @@ function CompetitionView({ target, isSelf, onClose, onArtists, onVoters }) {
               ['Voting closes', fmtDateTime(c.votingClosingDateTime)],
               ['Top results', fmtDateTime(c.top10ClosingDateTime)],
               ['Places in the top', c.topCount],
+              ['Artists left', c.artistsLeft != null && c.topCount ? `${c.artistsLeft} of top ${c.topCount}` : null],
             ]}
           />
           <div className="mt-5 flex flex-wrap gap-2">
             <button onClick={() => onArtists(c)} className={btnPrimary}>
               View artists
             </button>
-            {isSelf && c.votingClosed && c.canViewVoters && (
+            {c.votingClosed && c.canViewVoters && (
               <button onClick={() => onVoters(c)} className={btnGhost}>
                 Top voters
               </button>
@@ -463,9 +503,7 @@ function TopVotersView({ target, onClose }) {
                       )}
                       <span className="truncate">{v.name}</span>
                     </span>
-                    <span className="flex-none font-black text-[#543737]">
-                      {v.votes} {v.votes === 1 ? 'vote' : 'votes'}
-                    </span>
+                    <span className="flex-none font-black text-[#543737]">{plural(v.votes, 'vote', 'votes')}</span>
                   </div>
                   <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#f3eef0]">
                     <div className="h-full rounded-full bg-[#543737]" style={{ width: `${(v.votes / max) * 100}%` }} />
@@ -659,6 +697,7 @@ export default function Profile() {
         />
       );
     }
+
     if (activeTab.key === 'competitions') {
       return (
         <ItemCard
@@ -667,9 +706,7 @@ export default function Profile() {
           title={item.name}
           subtitle={item.type === 'post_event' ? 'Hosted event' : 'Judged competition'}
           chips={
-            item.awaitingApproval ? (
-              <Chip tone="bg-amber-50 text-amber-800 ring-amber-200">Awaiting approval</Chip>
-            ) : item.votingClosed ? (
+            item.votingClosed ? (
               <Chip tone="bg-slate-100 text-slate-600 ring-slate-200">Voting closed</Chip>
             ) : (
               <Chip tone="bg-emerald-50 text-emerald-700 ring-emerald-200">Open</Chip>
@@ -680,7 +717,20 @@ export default function Profile() {
         />
       );
     }
-    // votes
+
+    // votes: the number is only shown once voting has closed.
+    // While voting is still open, the card opens the voting page so the user can vote again.
+    const closed = item.votingClosed;
+    const canVoteAgain = !closed && item.votingStatus === 'eligible';
+    const statusChip = VOTING_CHIP[item.votingStatus];
+    const openArtist = () =>
+      setSelectedArtist({
+        competitionId: item.competitionId,
+        artistId: item.artistId,
+        source: item.source,
+        name: item.name,
+      });
+
     return (
       <ItemCard
         key={item.id}
@@ -688,20 +738,29 @@ export default function Profile() {
         title={item.name}
         subtitle={item.competitionName}
         chips={
-          <Chip tone="bg-pink-50 text-pink-700 ring-pink-200">
-            ♡ {item.totalVotes} {item.totalVotes === 1 ? 'vote' : 'votes'}
-          </Chip>
+          closed ? (
+            <Chip tone="bg-pink-50 text-pink-700 ring-pink-200">
+              ♡ {plural(item.totalVotes ?? 0, 'vote', 'votes')}
+            </Chip>
+          ) : statusChip ? (
+            <Chip tone={statusChip[1]}>{statusChip[0]}</Chip>
+          ) : (
+            <Chip tone="bg-emerald-50 text-emerald-700 ring-emerald-200">Voting open</Chip>
+          )
         }
-        meta={item.lastVotedAt ? `Last voted ${fmtDate(item.lastVotedAt)}` : null}
+        meta={
+          closed
+            ? `You cast ${plural(item.totalVotes ?? 0, 'vote', 'votes')}`
+            : canVoteAgain
+              ? 'Tap to vote again'
+              : null
+        }
         onClick={
-          item.competitionId
+          item.competitionId && item.artistId
             ? () =>
-                setSelectedArtist({
-                  competitionId: item.competitionId,
-                  artistId: item.artistId,
-                  source: item.source,
-                  name: item.name,
-                })
+                canVoteAgain
+                  ? goVote({ competitionId: item.competitionId, id: item.artistId, source: item.source })
+                  : openArtist()
             : undefined
         }
       />
@@ -912,7 +971,6 @@ export default function Profile() {
       {selectedCompetition && (
         <CompetitionView
           target={selectedCompetition}
-          isSelf={profile.isSelf}
           onClose={() => setSelectedCompetition(null)}
           onArtists={openArtists}
           onVoters={openCompetitionVoters}

@@ -127,6 +127,37 @@ def hosts_competition(uid: str, comp: dict) -> bool:
     return uid in (comp.get("hosterUid"), comp.get("ownerUid"), comp.get("registeredByUid"))
 
 
+def top_count(comp: dict) -> Optional[int]:
+    """How many artists should be left at the end (the competition's topCount)."""
+    v = comp.get("topCount") or (comp.get("judgeFormDetails") or {}).get("topCount")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        return None
+    return int(v)
+
+
+def remaining_artists(cid: str) -> int:
+    """Accepted artists of a judged competition who are still in (not eliminated)."""
+    n = 0
+    for s in db().collection(ACCEPTED).where(filter=FieldFilter("judgeFormId", "==", cid)).stream():
+        d = s.to_dict() or {}
+        if d.get("isEliminated") is not True and d.get("status") != "eliminated":
+            n += 1
+    return n
+
+
+def can_eliminate(uid: str, token: dict, source: str, comp: dict, artist: dict, remaining: Optional[int]) -> bool:
+    """Whether the Eliminate button should show for this artist."""
+    if source != JUDGE_FORM or remaining is None or not is_owner(uid, token, comp):
+        return False
+    if artist.get("isEliminated") is True or artist.get("status") == "eliminated":
+        return False
+    end = voting_end(comp)
+    if end and datetime.now(timezone.utc) >= end:
+        return False
+    top = top_count(comp)
+    return top is not None and remaining > top
+
+
 def get_parent(source: str, cid: str) -> dict:
     snap = db().collection(source).document(cid).get()
     if not snap.exists:
@@ -581,7 +612,9 @@ def _settle(tx, ref, new_status, on_paid=None, amount_field=None, gross=None):
     data = snap.to_dict() or {}
     if data.get("status") not in PENDING_STATES:
         return "already processed"
-    if amount_field and gross is not None:
+    if amount_field:
+        if gross is None:
+            return "missing amount from PayFast"
         raw = data.get(amount_field)
         if raw is None and amount_field == "totalAmount":
             raw = data.get("registrationFee")  # older pending documents only stored the fee
@@ -611,7 +644,7 @@ def _hoster_paid(payment_id: str):
     def run(tx, data):
         target = data.get("targetCollection") or "posts"
         live = {k: v for k, v in data.items() if k not in ("targetCollection", "createdAt", "ticketListing")}
-        live["status"] = "approved"  # paid, so the competition is live straight away (nothing to approve)
+        live["status"] = "approved"  # paid, so the competition is live straight away
         live["paidAt"] = firestore.SERVER_TIMESTAMP
         tx.set(db().collection(target).document(payment_id), live)
 
@@ -830,14 +863,13 @@ def getDashboardData(req: https_fn.CallableRequest) -> dict:
     me = _my_profile(uid, token)
 
     # ---- competitions in scope (owner: where hosterUid == their uid)
-    skip = HIDDEN_STATES if scope == "all" else ("pending_payment", "payfast_pending", "rejected")
     comps = []
     for source in ("posts", JUDGE_FORM):
         col = db().collection(source)
         query = col.limit(200) if scope == "all" else col.where(filter=FieldFilter("hosterUid", "==", uid)).limit(200)
         for snap in query.stream():
             d = snap.to_dict() or {}
-            if d.get("status") in skip:
+            if d.get("status") in HIDDEN_STATES:
                 continue
             comps.append((source, snap.id, d))
 
@@ -889,7 +921,6 @@ def getDashboardData(req: https_fn.CallableRequest) -> dict:
     for source, cid, d in comps:
         end = voting_end(d)
         closed = bool(end and end <= now)
-        awaiting = d.get("status") == "pending_approval"
         begin = _as_dt(d.get("paidAt")) or _as_dt(d.get("submissionTimestamp"))
         if closed:
             progress = 100
@@ -898,9 +929,7 @@ def getDashboardData(req: https_fn.CallableRequest) -> dict:
         else:
             progress = 0
 
-        if awaiting:
-            status = "Awaiting approval"
-        elif closed:
+        if closed:
             status = "Voting closed"
         elif end and end - now <= CLOSING_SOON:
             status = "Closing soon"
@@ -915,24 +944,23 @@ def getDashboardData(req: https_fn.CallableRequest) -> dict:
             "progress": progress,
             "status": status,
             "closed": closed,
-            "awaiting": awaiting,
             "_owner": d.get("hosterUid") or d.get("ownerUid") or d.get("registeredByUid") or "",
             "_doc": d,
         })
 
-    active_count = sum(1 for c in competitions if not c["closed"] and not c["awaiting"])
-    competitions.sort(key=lambda c: (c["closed"], c["awaiting"], -c["votes"]))
+    active_count = sum(1 for c in competitions if not c["closed"])
+    competitions.sort(key=lambda c: (c["closed"], -c["votes"]))
     top = competitions[:8]
 
     owners = {}
     competitions = []
+    profiles = {}
     if scope == "all":
         profiles = _owner_profiles([c["_owner"] for c in top])
     for c in top:
         owner_uid = c.pop("_owner", "")
         doc = c.pop("_doc", {})
         c.pop("closed", None)
-        c.pop("awaiting", None)
         if scope == "all":
             info = _owner_info(owner_uid, profiles.get(owner_uid, {}), doc)
             key = owner_uid or info["email"] or c["id"]
@@ -1287,6 +1315,7 @@ def _artists_list(uid: str, token: dict) -> dict:
         results_public = bool(end and now > end + RESULTS_DELAY)
         can_manage = is_owner(uid, token, comp)
         best = max((it["votes_n"] for it in group if not it["eliminated"]), default=0)
+        left = sum(1 for it in group if not it["eliminated"]) if source == JUDGE_FORM else None
 
         for it in group:
             data = it["data"]
@@ -1325,6 +1354,9 @@ def _artists_list(uid: str, token: dict) -> dict:
                 "votingStatus": vs,
                 "origin": "accepted" if source == JUDGE_FORM else "registered",
                 "acceptedId": it["doc_id"] if source == JUDGE_FORM else None,
+                "artistsLeft": left,
+                "topCount": top_count(comp),
+                "canEliminate": can_eliminate(uid, token, source, comp, data, left),
             })
 
     rows.sort(key=lambda r: (r["competitionName"].lower(), STATUS_RANK.get(r["status"], 99), r["artistName"].lower()))
@@ -1394,11 +1426,33 @@ def _eliminate_artist(uid: str, token: dict, accepted_id: str) -> dict:
     end = voting_end(comp)
     if end and datetime.now(timezone.utc) >= end:
         raise ApiError(400, "Voting has closed, so artists can no longer be eliminated.")
-    if data.get("isEliminated") is True:
+    if data.get("isEliminated") is True or data.get("status") == "eliminated":
         return {"success": True, "message": "Artist was already eliminated."}
-    ref.update({"isEliminated": True, "eliminatedAt": firestore.SERVER_TIMESTAMP})
-    print(f"[API] eliminated {ACCEPTED}/{accepted_id} by {uid}", flush=True)
-    return {"success": True, "message": "Artist eliminated."}
+
+    top = top_count(comp)
+    if top is None:
+        raise ApiError(400, "This competition has no top count set.")
+    remaining = remaining_artists(cid)
+    if remaining <= top:
+        raise ApiError(400, f"Only {top} artists are left, so no more can be eliminated.")
+
+    ref.update({"isEliminated": True, "status": "eliminated", "eliminatedAt": firestore.SERVER_TIMESTAMP})
+    remaining -= 1
+    reached = remaining <= top
+    if reached:
+        # the artists who are left are the finalists
+        for s in db().collection(ACCEPTED).where(filter=FieldFilter("judgeFormId", "==", cid)).stream():
+            d = s.to_dict() or {}
+            if d.get("isEliminated") is not True and d.get("status") != "eliminated":
+                s.reference.update({"isTop10Finalist": True})
+    print(f"[API] eliminated {ACCEPTED}/{accepted_id} by {uid}; left={remaining}/{top}", flush=True)
+    return {
+        "success": True,
+        "message": "Artist eliminated." + (" The top artists are now final." if reached else ""),
+        "artistsLeft": remaining,
+        "topCount": top,
+        "reachedTop": reached,
+    }
 
 
 # ------------------------------------------------------------------ image upload
@@ -1495,7 +1549,7 @@ def _profile_artist_posts(pid: str, get_comp) -> list:
             "competitionName": comp.get("companyName") or "",
             "images": d.get("images") or [],
             "votingStatus": voting_status(d, comp),
-            "eliminated": d.get("isEliminated") is True,
+            "eliminated": d.get("isEliminated") is True or d.get("status") == "eliminated",
             "type": "accepted_artist",
             "date": _iso_utc(when) if when else None,
         })
@@ -1521,7 +1575,6 @@ def _profile_competitions(pid: str, is_self: bool) -> list:
                 "name": d.get("companyName") or "Untitled competition",
                 "images": d.get("images") or [],
                 "type": "post_event" if source == "posts" else "judge_event",
-                "awaitingApproval": status == "pending_approval",
                 "votingClosed": bool(end and end <= now),
                 "votingClosesAt": _iso_utc(end) if end else None,
                 "date": _iso_utc(when) if when else None,
@@ -1531,6 +1584,7 @@ def _profile_competitions(pid: str, is_self: bool) -> list:
 
 
 def _profile_votes(pid: str, get_comp) -> list:
+    """Every artist this user has paid votes for. The vote count is only revealed once voting has closed."""
     grouped = {}
     query = (
         db().collection(PENDING_VOTES)
@@ -1559,10 +1613,13 @@ def _profile_votes(pid: str, get_comp) -> list:
         ACCEPTED, [f"{g['competitionId']}_{g['artistId']}" for g in grouped.values() if g["source"] == JUDGE_FORM]
     )
 
+    now = datetime.now(timezone.utc)
     out = []
     for key, g in grouped.items():
         art = post_docs.get(key) if g["source"] == "posts" else judge_docs.get(f"{g['competitionId']}_{g['artistId']}")
         comp = get_comp(g["source"], g["competitionId"]) if g["competitionId"] else None
+        end = voting_end(comp or {}) or voting_end(art or {})
+        closed = bool(end and now >= end)
         out.append({
             "id": key,
             "artistId": g["artistId"],
@@ -1571,7 +1628,11 @@ def _profile_votes(pid: str, get_comp) -> list:
             "name": g["name"],
             "competitionName": (comp or {}).get("companyName") or "",
             "images": (art or {}).get("images") or [],
-            "totalVotes": g["totalVotes"],
+            "votingClosed": closed,
+            "votingClosesAt": _iso_utc(end) if end else None,
+            "votingStatus": voting_status(art or {}, comp or {}),
+            # the number is only revealed after voting closes
+            "totalVotes": g["totalVotes"] if closed else None,
             "lastVotedAt": _iso_utc(g["last"]) if g["last"] else None,
         })
     out.sort(key=lambda x: x["lastVotedAt"] or "", reverse=True)
@@ -1660,6 +1721,7 @@ def _artist_voting(uid: str, token: dict, cid: str, artist_id: str, source: str)
     artist, comp = find_voting_artist(source, cid, artist_id)
     end = voting_end(comp) or voting_end(artist)
     top10 = top10_end(artist) or top10_end(comp)
+    remaining = remaining_artists(cid) if source == JUDGE_FORM else None
     return {
         "success": True,
         "artist": {
@@ -1676,6 +1738,10 @@ def _artist_voting(uid: str, token: dict, cid: str, artist_id: str, source: str)
             "pricePerVote": PRICE_PER_VOTE,
             "maxVotes": MAX_VOTES_PER_PURCHASE,
             "canViewVoters": is_owner(uid, token, comp) or uid == artist_id,
+            "acceptedId": f"{cid}_{artist_id}" if source == JUDGE_FORM else None,
+            "artistsLeft": remaining,
+            "topCount": top_count(comp),
+            "canEliminate": can_eliminate(uid, token, source, comp, artist, remaining),
         },
     }
 
@@ -1711,9 +1777,9 @@ def _competition_overview(uid: str, token: dict, cid: str, source: str) -> dict:
             "artistClosingDateTime": _iso_utc(closes) if closes else None,
             "votingClosingDateTime": _iso_utc(end) if end else None,
             "top10ClosingDateTime": _iso_utc(top10) if top10 else None,
-            "topCount": comp.get("topCount") or details.get("topCount"),
+            "topCount": top_count(comp),
+            "artistsLeft": remaining_artists(cid) if source == JUDGE_FORM else None,
             "votingClosed": bool(end and end <= now),
-            "awaitingApproval": comp.get("status") == "pending_approval",
             "isOwner": owner,
             "canViewVoters": owner,
         },
@@ -1733,7 +1799,6 @@ def _top_voters(uid: str, token: dict, cid: str, source: str, artist_id: Optiona
     query = (
         db().collection(PENDING_VOTES)
         .where(filter=FieldFilter("competitionId", "==", cid))
-        .where(filter=FieldFilter("source", "==", source))
         .where(filter=FieldFilter("status", "==", "payment_complete"))
     )
     if artist_id:
@@ -1742,6 +1807,8 @@ def _top_voters(uid: str, token: dict, cid: str, source: str, artist_id: Optiona
     totals = {}
     for snap in query.limit(5000).stream():
         d = snap.to_dict() or {}
+        if (d.get("source") or "posts") != source:  # a posts id and a judge-form id can never mix
+            continue
         voter = d.get("voterUid") or "unknown"
         totals[voter] = totals.get(voter, 0) + int(d.get("voteQuantity") or 0)
 
